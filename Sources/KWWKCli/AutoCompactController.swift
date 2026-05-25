@@ -82,6 +82,13 @@ final class AutoCompactController {
         self.onCompactFinished = onCompactFinished
     }
 
+    /// Sum of all four usage components reported by an assistant turn.
+    /// Typed `KWWKAI.Usage` to disambiguate from this type's nested
+    /// `Usage`; see the type doc for why all four are summed.
+    private static func tokenCount(_ u: KWWKAI.Usage?) -> Int {
+        (u?.input ?? 0) + (u?.output ?? 0) + (u?.cacheRead ?? 0) + (u?.cacheWrite ?? 0)
+    }
+
     /// Recompute usage from the most recent assistant turn's reported
     /// token counts.
     func currentUsage() -> Usage {
@@ -92,9 +99,7 @@ final class AutoCompactController {
                 break
             }
         }
-        let u = lastAssistant?.usage
-        let tokens = (u?.input ?? 0) + (u?.output ?? 0)
-            + (u?.cacheRead ?? 0) + (u?.cacheWrite ?? 0)
+        let tokens = Self.tokenCount(lastAssistant?.usage)
         let window = agent.state.model.contextWindow
         return Usage(tokens: tokens, window: window)
     }
@@ -178,9 +183,7 @@ final class AutoCompactController {
         for message in context.messages.reversed() {
             if case .assistant(let a) = message { lastAssistant = a; break }
         }
-        let u = lastAssistant?.usage
-        let tokens = (u?.input ?? 0) + (u?.output ?? 0)
-            + (u?.cacheRead ?? 0) + (u?.cacheWrite ?? 0)
+        let tokens = Self.tokenCount(lastAssistant?.usage)
         let window = agent.state.model.contextWindow
         guard window > 0, Double(tokens) / Double(window) >= threshold else {
             return nil
