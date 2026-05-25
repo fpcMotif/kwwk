@@ -66,6 +66,8 @@ struct KwwkCLI {
         (args, context1m) = extractBoolFlag(args, "--context-1m")
         let draftPrompt: String?
         (args, draftPrompt) = extractStringFlag(args, "--draft")
+        let builtinSubagents: BuiltinSubagentSelection
+        (args, builtinSubagents) = extractBuiltinSubagents(args)
 
         let subcommand = args.first
 
@@ -79,6 +81,7 @@ struct KwwkCLI {
                 context1m: context1m
             )
             await runOrExit { try await KWWK.runCodingTUI(
+                builtinSubagents: builtinSubagents,
                 thinkingLevel: runtime.thinkingLevel,
                 modelOverride: runtime.modelOverride,
                 context1m: runtime.context1m,
@@ -132,7 +135,8 @@ struct KwwkCLI {
                 rest: Array(args.dropFirst()),
                 thinkingLevel: runtime.thinkingLevel,
                 modelOverride: runtime.modelOverride,
-                context1m: runtime.context1m
+                context1m: runtime.context1m,
+                builtinSubagents: builtinSubagents
             )
         case "-h", "--help":
             printUsage()
@@ -3133,6 +3137,41 @@ struct KwwkCLI {
         return (out, seen)
     }
 
+    /// Pull built-in subagent selection flags out of argv. `--subagents`
+    /// accepts a comma-separated list; `--no-subagents` is equivalent to
+    /// `--subagents none`. If both are present, the later flag wins.
+    static func extractBuiltinSubagents(_ argv: [String]) -> ([String], BuiltinSubagentSelection) {
+        var out: [String] = []
+        var selection: BuiltinSubagentSelection = .all
+        var i = 0
+        while i < argv.count {
+            switch argv[i] {
+            case "--no-subagents":
+                selection = .none
+                i += 1
+            case "--subagents":
+                guard i + 1 < argv.count else {
+                    FileHandle.standardError.write(Data(
+                        "kwwk: --subagents needs one of: \(BuiltinSubagentSelection.validNames)\n".utf8
+                    ))
+                    Foundation.exit(2)
+                }
+                guard let parsed = BuiltinSubagentSelection.parseList(argv[i + 1]) else {
+                    FileHandle.standardError.write(Data(
+                        "kwwk: --subagents needs one of: \(BuiltinSubagentSelection.validNames)\n".utf8
+                    ))
+                    Foundation.exit(2)
+                }
+                selection = parsed
+                i += 2
+            default:
+                out.append(argv[i])
+                i += 1
+            }
+        }
+        return (out, selection)
+    }
+
     /// Handle `-p` / `--print`. Everything after the flag is joined into
     /// the prompt; if nothing is supplied (or the token is a bare `-`),
     /// the prompt is read from stdin until EOF.
@@ -3146,7 +3185,8 @@ struct KwwkCLI {
         rest: [String],
         thinkingLevel: ThinkingLevel,
         modelOverride: String?,
-        context1m: Bool
+        context1m: Bool,
+        builtinSubagents: BuiltinSubagentSelection
     ) async {
         let prompt: String
         if rest.isEmpty || rest == ["-"] {
@@ -3176,6 +3216,7 @@ struct KwwkCLI {
             let capture = HeadlessRunCapture()
             let code = try await KWWK.runHeadless(
                 prompt: prompt,
+                builtinSubagents: builtinSubagents,
                 thinkingLevel: thinkingLevel,
                 modelOverride: modelOverride,
                 context1m: context1m,

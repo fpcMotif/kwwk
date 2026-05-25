@@ -167,8 +167,6 @@ public actor OAuthManager {
     public static func defaultProviders() -> [OAuthProvider] {
         [
             AnthropicOAuthProvider(),
-            GoogleOAuthProvider.geminiCli(),
-            GoogleOAuthProvider.antigravity(),
             OpenAICodexOAuthProvider(),
             GitHubCopilotOAuthProvider(),
         ]
@@ -194,14 +192,24 @@ public actor OAuthManager {
         return try await provider.apiKey(from: credentials, using: client)
     }
 
-    /// Build an `Agent.apiKeyResolver`-shaped closure. The resolver receives
-    /// a Model.provider string; we map common provider ids to our OAuth ids.
-    public nonisolated func resolver() -> @Sendable (String) async -> String? {
+    /// Build an auth resolver closure. The resolver receives the active model;
+    /// we map common provider ids to our OAuth ids and return a bearer token.
+    public nonisolated func resolver() -> @Sendable (Model, String?) async -> ResolvedProviderAuth? {
         let manager = self
-        return { provider in
-            let oauthId = Self.oauthId(forProvider: provider)
-            return try? await manager.apiKey(for: oauthId)
+        return { model, _ in
+            let oauthId = Self.oauthId(forProvider: model.provider)
+            return try? await manager.resolvedAuth(for: oauthId)
         }
+    }
+
+    private func resolvedAuth(for providerId: String) async throws -> ResolvedProviderAuth {
+        let token = try await apiKey(for: providerId)
+        let credentials = await store.get(providerId)
+        return ResolvedProviderAuth(
+            token: token,
+            scheme: .bearer,
+            baseURL: Self.baseURL(forOAuthId: providerId, credentials: credentials)
+        )
     }
 
     private static func oauthId(forProvider provider: String) -> String {
@@ -209,9 +217,16 @@ public actor OAuthManager {
         case "anthropic": return "anthropic"
         case "github-copilot": return "github-copilot"
         case "openai-codex": return "openai-codex"
-        case "google-gemini-cli": return "google-gemini-cli"
-        case "google-antigravity": return "google-antigravity"
         default: return provider
         }
+    }
+
+    private static func baseURL(forOAuthId providerId: String, credentials: OAuthCredentials?) -> String? {
+        guard providerId == "github-copilot",
+              case .string(let endpoint) = credentials?.extras["endpoint"] ?? .null,
+              !endpoint.isEmpty else {
+            return nil
+        }
+        return endpoint
     }
 }

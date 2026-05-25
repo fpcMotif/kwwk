@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import Testing
 @testable import KWWKAI
 
@@ -114,39 +117,6 @@ struct AnthropicOAuthTests {
     }
 }
 
-@Suite("OAuth refresh — Google (Gemini CLI)")
-struct GoogleOAuthTests {
-    @Test("POSTs x-www-form-urlencoded body") func geminiRefresh() async throws {
-        let body = #"{"access_token":"gca","refresh_token":"gcr","expires_in":3600}"#
-        let client = StubResponseClient(body: Data(body.utf8))
-        let provider = GoogleOAuthProvider.geminiCli()
-        _ = try await provider.refresh(
-            OAuthCredentials(access: "a", refresh: "r", expires: 0, extras: ["projectId": .string("p-1")]),
-            using: client
-        )
-        let req = client.lastRequest!
-        #expect(req.headers["content-type"] == "application/x-www-form-urlencoded")
-        let sent = String(data: req.body ?? Data(), encoding: .utf8) ?? ""
-        #expect(sent.contains("grant_type=refresh_token"))
-        #expect(sent.contains("refresh_token=r"))
-        #expect(sent.contains("client_id="))
-        #expect(sent.contains("client_secret="))
-    }
-
-    @Test("preserves extras across refresh") func preservesExtras() async throws {
-        let body = #"{"access_token":"a2","expires_in":100}"#
-        let client = StubResponseClient(body: Data(body.utf8))
-        let updated = try await GoogleOAuthProvider.geminiCli().refresh(
-            OAuthCredentials(
-                access: "a1", refresh: "r1", expires: 0,
-                extras: ["projectId": .string("abc")]
-            ),
-            using: client
-        )
-        #expect(updated.extras["projectId"] == .string("abc"))
-    }
-}
-
 @Suite("OAuth refresh — OpenAI Codex")
 struct OpenAICodexOAuthTests {
     @Test("form POST + persists accountId from JWT") func codexRefresh() async throws {
@@ -250,7 +220,7 @@ struct OAuthManagerTests {
         }
     }
 
-    @Test("resolver() returns an agent-compatible api-key closure") func resolverShape() async throws {
+    @Test("resolver() returns an agent-compatible auth closure") func resolverShape() async throws {
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("kw-oauth-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: tmp) }
@@ -262,7 +232,37 @@ struct OAuthManagerTests {
         )
         let manager = OAuthManager(store: store, providers: [AnthropicOAuthProvider()])
         let resolver = manager.resolver()
-        #expect(await resolver("anthropic") == "static")
-        #expect(await resolver("unknown-xyz") == nil)
+        let model = Model(id: "claude", api: "anthropic-messages", provider: "anthropic")
+        let auth = await resolver(model, nil)
+        #expect(auth?.token == "static")
+        #expect(auth?.scheme == .bearer)
+        let unknown = Model(id: "unknown", api: "unknown", provider: "unknown-xyz")
+        #expect(await resolver(unknown, nil) == nil)
+    }
+
+    @Test("resolver() includes GitHub Copilot endpoint as baseURL") func resolverPreservesCopilotEndpoint() async throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kw-oauth-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let endpoint = "https://api.business.githubcopilot.com"
+        let store = OAuthStore(url: tmp)
+        try await store.set(
+            OAuthCredentials(
+                access: "session-token",
+                refresh: "ghp_pat",
+                expires: Int64.max / 2,
+                extras: ["endpoint": .string(endpoint)]
+            ),
+            for: "github-copilot"
+        )
+        let manager = OAuthManager(store: store, providers: [GitHubCopilotOAuthProvider()])
+        let resolver = manager.resolver()
+        let model = Model(id: "gpt-4.1", api: "openai-completions", provider: "github-copilot")
+
+        let auth = await resolver(model, nil)
+        #expect(auth?.token == "session-token")
+        #expect(auth?.scheme == .bearer)
+        #expect(auth?.baseURL == endpoint)
     }
 }

@@ -8,6 +8,7 @@ public struct AgentLoopConfig: Sendable {
     public var reasoning: ReasoningLevel?
     public var thinkingBudgets: ThinkingBudgets?
     public var sessionId: String?
+    public var verboseEnabled: Bool
     public var maxRetryDelayMs: Int?
     public var toolExecution: ToolExecutionMode
     public var toolChoice: ToolChoice?
@@ -21,7 +22,7 @@ public struct AgentLoopConfig: Sendable {
     public var retryBaseDelayMs: UInt64
     public var getSteeringMessages: @Sendable () async -> [Message]
     public var getFollowUpMessages: @Sendable () async -> [Message]
-    public var apiKeyResolver: (@Sendable (String) async -> String?)?
+    public var authResolver: (@Sendable (Model, String?) async -> ResolvedProviderAuth?)?
     public var beforeToolCall: BeforeToolCallHook?
     public var afterToolCall: AfterToolCallHook?
     public var userPromptSubmit: UserPromptSubmitHook?
@@ -34,6 +35,7 @@ public struct AgentLoopConfig: Sendable {
         reasoning: ReasoningLevel? = nil,
         thinkingBudgets: ThinkingBudgets? = nil,
         sessionId: String? = nil,
+        verboseEnabled: Bool = false,
         maxRetryDelayMs: Int? = nil,
         toolExecution: ToolExecutionMode = .parallel,
         toolChoice: ToolChoice? = nil,
@@ -42,7 +44,7 @@ public struct AgentLoopConfig: Sendable {
         retryBaseDelayMs: UInt64 = 1_000,
         getSteeringMessages: @escaping @Sendable () async -> [Message] = { [] },
         getFollowUpMessages: @escaping @Sendable () async -> [Message] = { [] },
-        apiKeyResolver: (@Sendable (String) async -> String?)? = nil,
+        authResolver: (@Sendable (Model, String?) async -> ResolvedProviderAuth?)? = nil,
         beforeToolCall: BeforeToolCallHook? = nil,
         afterToolCall: AfterToolCallHook? = nil,
         userPromptSubmit: UserPromptSubmitHook? = nil,
@@ -54,6 +56,7 @@ public struct AgentLoopConfig: Sendable {
         self.reasoning = reasoning
         self.thinkingBudgets = thinkingBudgets
         self.sessionId = sessionId
+        self.verboseEnabled = verboseEnabled
         self.maxRetryDelayMs = maxRetryDelayMs
         self.toolExecution = toolExecution
         self.toolChoice = toolChoice
@@ -62,7 +65,7 @@ public struct AgentLoopConfig: Sendable {
         self.retryBaseDelayMs = retryBaseDelayMs
         self.getSteeringMessages = getSteeringMessages
         self.getFollowUpMessages = getFollowUpMessages
-        self.apiKeyResolver = apiKeyResolver
+        self.authResolver = authResolver
         self.beforeToolCall = beforeToolCall
         self.afterToolCall = afterToolCall
         self.userPromptSubmit = userPromptSubmit
@@ -203,9 +206,12 @@ public enum AgentLoop {
         // `run()` were already appended before we got here — they are part of
         // the "prior" context, not the "new" delta, which matches how the
         // original parallel-array version behaved).
-        let baseCount = currentContext.messages.count
+        var baseCount = currentContext.messages.count
         func delta() -> [Message] {
-            Array(currentContext.messages[baseCount...])
+            guard currentContext.messages.count >= baseCount else {
+                return currentContext.messages
+            }
+            return Array(currentContext.messages[baseCount...])
         }
 
         // Run-level telemetry accumulated into `AgentRunSummary` and
@@ -342,6 +348,9 @@ public enum AgentLoop {
                     )
                     for result in toolResults {
                         currentContext.messages.append(.toolResult(result))
+                        if let subagent = subagentRunSummary(from: result) {
+                            summary.subagents.append(subagent)
+                        }
                     }
                 }
 
@@ -354,8 +363,13 @@ public enum AgentLoop {
                 // which is exactly what we want for "compact is a
                 // blocking state".
                 if let hook = config.betweenTurns {
+                    let beforeHookCount = currentContext.messages.count
                     if let replacement = await hook(currentContext, cancellation) {
                         currentContext = replacement
+                        if currentContext.messages.count < baseCount ||
+                           currentContext.messages.count < beforeHookCount {
+                            baseCount = 0
+                        }
                     }
                 }
 
@@ -438,17 +452,31 @@ public enum AgentLoop {
             tools: context.tools.map { $0.toKWAITool() }
         )
 
-        let resolvedKey = await config.apiKeyResolver?(config.model.provider)
+        let resolvedAuth = await config.authResolver?(config.model, config.sessionId)
+        var requestModel = config.model
+        if let baseURL = resolvedAuth?.baseURL, !baseURL.isEmpty {
+            requestModel.baseUrl = baseURL
+        }
+        let mergedMetadata: [String: JSONValue]? = {
+            guard let authMetadata = resolvedAuth?.metadata, !authMetadata.isEmpty else { return nil }
+            return authMetadata
+        }()
         let options = StreamOptions(
-            apiKey: resolvedKey,
+            apiKey: resolvedAuth?.token,
             cacheRetention: nil,
             sessionId: config.sessionId,
             maxRetryDelayMs: config.maxRetryDelayMs,
+            metadata: mergedMetadata,
+            resolvedAuth: resolvedAuth,
             reasoning: config.reasoning,
             thinkingBudgets: config.thinkingBudgets,
             cancellation: cancellation,
             toolChoice: config.toolChoice,
-            parallelToolCalls: config.parallelToolCalls
+            parallelToolCalls: config.parallelToolCalls,
+            verbose: config.verboseEnabled,
+            onVerbose: { event in
+                await emit(.verbose(event))
+            }
         )
 
         var lastError: Error?
@@ -459,7 +487,7 @@ public enum AgentLoop {
             }
 
             do {
-                let response = try await streamFn(config.model, llmContext, options)
+                let response = try await streamFn(requestModel, llmContext, options)
 
                 // Live-stream events as they arrive so the UI shows tokens
                 // in real time. A retryable mid-stream error emits
@@ -787,6 +815,9 @@ public enum AgentLoop {
                 args: call.arguments,
                 partialResult: partial
             ))
+            for runtimeEvent in partial.runtimeEvents ?? [] {
+                emitBox.launchUpdate(.runtimeEvent(runtimeEvent))
+            }
         }
         do {
             let result = try await prepared.tool.execute(prepared.call.id, prepared.args, cancellation, onUpdate)
@@ -799,6 +830,16 @@ public enum AgentLoop {
                 message = "aborted by user"
             } else {
                 message = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            }
+            if let structured = error as? StructuredToolExecutionError {
+                return ExecutedOutcome(
+                    result: errorToolResult(
+                        message,
+                        details: structured.details,
+                        runtimeEvents: structured.runtimeEvents
+                    ),
+                    isError: true
+                )
             }
             return ExecutedOutcome(result: errorToolResult(message), isError: true)
         }
@@ -839,6 +880,9 @@ public enum AgentLoop {
             result: final,
             isError: isError
         ))
+        for runtimeEvent in final.runtimeEvents ?? [] {
+            await emit(.runtimeEvent(runtimeEvent))
+        }
         let message = ToolResultMessage(
             toolCallId: call.id,
             toolName: call.name,
@@ -851,8 +895,91 @@ public enum AgentLoop {
         return message
     }
 
-    private static func errorToolResult(_ text: String) -> AgentToolResult {
-        AgentToolResult(content: [.text(TextContent(text: text))], details: nil)
+    private static func errorToolResult(
+        _ text: String,
+        details: JSONValue? = nil,
+        runtimeEvents: [AgentRuntimeEvent]? = nil
+    ) -> AgentToolResult {
+        AgentToolResult(
+            content: [.text(TextContent(text: text))],
+            details: details,
+            runtimeEvents: runtimeEvents
+        )
+    }
+
+    private static func subagentRunSummary(from result: ToolResultMessage) -> SubagentRunSummary? {
+        guard result.toolName == "agent",
+              case .object(let details) = result.details ?? .null,
+              let subagentType = stringValue(details["subagent_type"]) else {
+            return nil
+        }
+        let statusRaw = stringValue(details["status"]) ?? (result.isError ? "failed" : "")
+        let status: SubagentRunStatus
+        switch statusRaw {
+        case "completed":
+            status = .completed
+        case "background_started":
+            status = .backgroundStarted
+        case "failed":
+            status = .failed
+        default:
+            status = result.isError ? .failed : .completed
+        }
+        return SubagentRunSummary(
+            subagentType: subagentType,
+            childSessionId: stringValue(details["child_session_id"]),
+            description: stringValue(details["description"]),
+            status: status,
+            model: stringValue(details["model"]),
+            stopReason: stringValue(details["stop_reason"]).flatMap(StopReason.init(rawValue:)),
+            usage: usageValue(details["usage"]),
+            turns: intValue(details["turns"]),
+            cost: costValue(details["cost"]),
+            durationMs: intValue(details["duration_ms"]),
+            backgroundTaskId: stringValue(details["task_id"]),
+            outputFile: stringValue(details["output_file"]),
+            errorMessage: stringValue(details["error_message"])
+        )
+    }
+
+    private static func stringValue(_ value: JSONValue?) -> String? {
+        guard case .string(let string) = value ?? .null else { return nil }
+        return string
+    }
+
+    private static func intValue(_ value: JSONValue?) -> Int? {
+        guard case .int(let int) = value ?? .null else { return nil }
+        return int
+    }
+
+    private static func doubleValue(_ value: JSONValue?) -> Double? {
+        switch value ?? .null {
+        case .double(let double): return double
+        case .int(let int): return Double(int)
+        default: return nil
+        }
+    }
+
+    private static func usageValue(_ value: JSONValue?) -> Usage? {
+        guard case .object(let object) = value ?? .null else { return nil }
+        return Usage(
+            input: intValue(object["input"]) ?? 0,
+            output: intValue(object["output"]) ?? 0,
+            cacheRead: intValue(object["cache_read"]) ?? 0,
+            cacheWrite: intValue(object["cache_write"]) ?? 0,
+            totalTokens: intValue(object["total_tokens"]) ?? 0
+        )
+    }
+
+    private static func costValue(_ value: JSONValue?) -> Cost? {
+        guard case .object(let object) = value ?? .null else { return nil }
+        return Cost(
+            input: doubleValue(object["input"]) ?? 0,
+            output: doubleValue(object["output"]) ?? 0,
+            cacheRead: doubleValue(object["cache_read"]) ?? 0,
+            cacheWrite: doubleValue(object["cache_write"]) ?? 0,
+            total: doubleValue(object["total"]) ?? 0
+        )
     }
 }
 

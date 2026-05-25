@@ -13,6 +13,7 @@ public struct AgentInitialState: Sendable {
     public var model: Model
     public var thinkingLevel: ThinkingLevel
     public var thinkingDisplay: ThinkingDisplay
+    public var verboseEnabled: Bool
     public var tools: [AgentTool]
     public var messages: [Message]
 
@@ -21,6 +22,7 @@ public struct AgentInitialState: Sendable {
         model: Model,
         thinkingLevel: ThinkingLevel = .off,
         thinkingDisplay: ThinkingDisplay = .collapsed,
+        verboseEnabled: Bool = false,
         tools: [AgentTool] = [],
         messages: [Message] = []
     ) {
@@ -28,6 +30,7 @@ public struct AgentInitialState: Sendable {
         self.model = model
         self.thinkingLevel = thinkingLevel
         self.thinkingDisplay = thinkingDisplay
+        self.verboseEnabled = verboseEnabled
         self.tools = tools
         self.messages = messages
     }
@@ -40,6 +43,22 @@ public enum AgentError: Error, Equatable {
     case listenerOutsideActiveRun
     case maxRetriesExceeded
     case aborted
+}
+
+public struct AgentAutoCompactOptions: Sendable {
+    public var threshold: Double?
+    public var config: AgentContextCompactionConfig
+    public var backgroundManager: BackgroundTaskManager?
+
+    public init(
+        threshold: Double? = 0.75,
+        config: AgentContextCompactionConfig = .init(),
+        backgroundManager: BackgroundTaskManager? = nil
+    ) {
+        self.threshold = threshold
+        self.config = config
+        self.backgroundManager = backgroundManager
+    }
 }
 
 public struct AgentOptions: Sendable {
@@ -61,7 +80,10 @@ public struct AgentOptions: Sendable {
     public var convertToLlm: ConvertToLlmHook?
     public var transformContext: TransformContextHook?
     public var betweenTurns: BetweenTurnsHook?
-    public var apiKeyResolver: (@Sendable (String) async -> String?)?
+    /// Automatic context compaction is enabled by default. Pass nil to
+    /// disable it for agents that need full transcript retention.
+    public var autoCompact: AgentAutoCompactOptions?
+    public var authResolver: (@Sendable (Model, String?) async -> ResolvedProviderAuth?)?
 
     public init(
         initialState: AgentInitialState,
@@ -81,7 +103,8 @@ public struct AgentOptions: Sendable {
         convertToLlm: ConvertToLlmHook? = nil,
         transformContext: TransformContextHook? = nil,
         betweenTurns: BetweenTurnsHook? = nil,
-        apiKeyResolver: (@Sendable (String) async -> String?)? = nil
+        autoCompact: AgentAutoCompactOptions? = AgentAutoCompactOptions(),
+        authResolver: (@Sendable (Model, String?) async -> ResolvedProviderAuth?)? = nil
     ) {
         self.initialState = initialState
         self.streamFn = streamFn
@@ -100,7 +123,8 @@ public struct AgentOptions: Sendable {
         self.convertToLlm = convertToLlm
         self.transformContext = transformContext
         self.betweenTurns = betweenTurns
-        self.apiKeyResolver = apiKeyResolver
+        self.autoCompact = autoCompact
+        self.authResolver = authResolver
     }
 }
 
@@ -128,7 +152,8 @@ public final class Agent: @unchecked Sendable {
     public var convertToLlm: ConvertToLlmHook?
     public var transformContext: TransformContextHook?
     public var betweenTurns: BetweenTurnsHook?
-    public var apiKeyResolver: (@Sendable (String) async -> String?)?
+    public var autoCompact: AgentAutoCompactOptions?
+    public var authResolver: (@Sendable (Model, String?) async -> ResolvedProviderAuth?)?
 
     /// Base delay (ms) used for exponential backoff between stream retries.
     /// Exposed internally so tests can shrink the 1-second default.
@@ -161,6 +186,7 @@ public final class Agent: @unchecked Sendable {
             model: options.initialState.model,
             thinkingLevel: options.initialState.thinkingLevel,
             thinkingDisplay: options.initialState.thinkingDisplay,
+            verboseEnabled: options.initialState.verboseEnabled,
             tools: options.initialState.tools,
             messages: options.initialState.messages
         )
@@ -180,9 +206,18 @@ public final class Agent: @unchecked Sendable {
         self.convertToLlm = options.convertToLlm
         self.transformContext = options.transformContext
         self.betweenTurns = options.betweenTurns
-        self.apiKeyResolver = options.apiKeyResolver
+        self.autoCompact = options.autoCompact
+        self.authResolver = options.authResolver
         self.steeringQueue = PendingMessageQueue(mode: options.steeringMode)
         self.followUpQueue = PendingMessageQueue(mode: options.followUpMode)
+    }
+
+    internal func streamForCompaction(
+        model: Model,
+        context: Context,
+        options: StreamOptions?
+    ) async throws -> AssistantMessageStream {
+        try await streamFn(model, context, options)
     }
 
     /// Queue a message to inject after the current assistant turn finishes.
@@ -376,6 +411,7 @@ extension Agent {
             reasoning: effectiveReasoning,
             thinkingBudgets: thinkingBudgets,
             sessionId: sessionId,
+            verboseEnabled: state.verboseEnabled,
             maxRetryDelayMs: maxRetryDelayMs,
             toolExecution: toolExecution,
             toolChoice: toolChoice,
@@ -387,13 +423,13 @@ extension Agent {
                 return steering.drain()
             },
             getFollowUpMessages: { followUp.drain() },
-            apiKeyResolver: apiKeyResolver,
+            authResolver: authResolver,
             beforeToolCall: beforeToolCall,
             afterToolCall: afterToolCall,
             userPromptSubmit: userPromptSubmit,
             convertToLlm: convertToLlm,
             transformContext: transformContext,
-            betweenTurns: betweenTurns
+            betweenTurns: builtInBetweenTurnsHook()
         )
     }
 
@@ -443,6 +479,71 @@ extension Agent {
         state.setStreamingMessage(nil)
         state.clearPendingToolCalls()
         for waiter in waiters { waiter.resume() }
+    }
+
+    private func builtInBetweenTurnsHook() -> BetweenTurnsHook? {
+        let userHook = betweenTurns
+        let autoCompact = autoCompact
+        guard userHook != nil || autoCompact?.threshold != nil else {
+            return nil
+        }
+
+        return { [weak self] context, cancellation in
+            guard let self else {
+                return await userHook?(context, cancellation)
+            }
+
+            var current = context
+            var replaced = false
+
+            if let autoCompact,
+               let threshold = autoCompact.threshold,
+               threshold > 0,
+               current.messages.count >= autoCompact.config.minMessages,
+               AgentContextCompactor.shouldCompact(
+                    messages: current.messages,
+                    model: self.state.model,
+                    threshold: threshold
+               ) {
+                let usage = AgentContextCompactor.currentUsage(
+                    messages: current.messages,
+                    model: self.state.model
+                )
+                await self.emitSynthetic(
+                    .compactStart(messagesCount: current.messages.count, usage: usage),
+                    cancellation: cancellation
+                )
+
+                self.state.messages = current.messages
+                let outcome = await AgentContextCompactor.compactAgent(
+                    agent: self,
+                    backgroundManager: autoCompact.backgroundManager,
+                    sessionId: self.sessionId,
+                    config: autoCompact.config,
+                    ignoreStreaming: true,
+                    cancellation: cancellation
+                )
+                await self.emitSynthetic(.compactEnd(outcome: outcome), cancellation: cancellation)
+
+                if case .compacted = outcome {
+                    current.messages = self.state.messages
+                    replaced = true
+                }
+            }
+
+            if let userHook, let replacement = await userHook(current, cancellation) {
+                current = replacement
+                replaced = true
+            }
+
+            return replaced ? current : nil
+        }
+    }
+
+    private func emitSynthetic(_ event: AgentEvent, cancellation: CancellationHandle?) async {
+        for listener in snapshotListeners() {
+            await listener(event, cancellation)
+        }
     }
 
     private func handleRunFailure(error: Error, aborted: Bool) async {

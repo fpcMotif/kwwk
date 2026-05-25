@@ -48,6 +48,35 @@ public struct ThinkingBudgets: Codable, Sendable, Hashable {
     }
 }
 
+public enum AuthScheme: Sendable, Hashable {
+    case none
+    case bearer
+    case apiKeyHeader(name: String)
+    case queryKey(name: String)
+}
+
+public struct ResolvedProviderAuth: Sendable, Hashable {
+    public var token: String?
+    public var scheme: AuthScheme
+    public var headers: [String: String]
+    public var baseURL: String?
+    public var metadata: [String: JSONValue]
+
+    public init(
+        token: String? = nil,
+        scheme: AuthScheme = .none,
+        headers: [String: String] = [:],
+        baseURL: String? = nil,
+        metadata: [String: JSONValue] = [:]
+    ) {
+        self.token = token
+        self.scheme = scheme
+        self.headers = headers
+        self.baseURL = baseURL
+        self.metadata = metadata
+    }
+}
+
 /// Whether the model is allowed/required to call tools. Providers that don't
 /// support a direct analog ignore this. Matches the common shape across
 /// Anthropic, OpenAI Responses, and OpenAI Completions.
@@ -74,6 +103,7 @@ public struct StreamOptions: Sendable {
     public var headers: [String: String]?
     public var maxRetryDelayMs: Int?
     public var metadata: [String: JSONValue]?
+    public var resolvedAuth: ResolvedProviderAuth?
     public var reasoning: ReasoningLevel?
     public var thinkingBudgets: ThinkingBudgets?
     public var cancellation: CancellationHandle?
@@ -88,6 +118,12 @@ public struct StreamOptions: Sendable {
     /// Providers that lack an analog ignore this.
     public var parallelToolCalls: Bool?
 
+    /// Enables provider/internal diagnostic logging for this stream.
+    public var verbose: Bool?
+
+    /// Optional sink used by providers to surface verbose diagnostics.
+    public var onVerbose: (@Sendable (VerboseEvent) async -> Void)?
+
     public init(
         temperature: Double? = nil,
         maxTokens: Int? = nil,
@@ -98,11 +134,14 @@ public struct StreamOptions: Sendable {
         headers: [String: String]? = nil,
         maxRetryDelayMs: Int? = nil,
         metadata: [String: JSONValue]? = nil,
+        resolvedAuth: ResolvedProviderAuth? = nil,
         reasoning: ReasoningLevel? = nil,
         thinkingBudgets: ThinkingBudgets? = nil,
         cancellation: CancellationHandle? = nil,
         toolChoice: ToolChoice? = nil,
-        parallelToolCalls: Bool? = nil
+        parallelToolCalls: Bool? = nil,
+        verbose: Bool? = nil,
+        onVerbose: (@Sendable (VerboseEvent) async -> Void)? = nil
     ) {
         self.temperature = temperature
         self.maxTokens = maxTokens
@@ -113,10 +152,22 @@ public struct StreamOptions: Sendable {
         self.headers = headers
         self.maxRetryDelayMs = maxRetryDelayMs
         self.metadata = metadata
+        self.resolvedAuth = resolvedAuth
         self.reasoning = reasoning
         self.thinkingBudgets = thinkingBudgets
         self.cancellation = cancellation
         self.toolChoice = toolChoice
         self.parallelToolCalls = parallelToolCalls
+        self.verbose = verbose
+        self.onVerbose = onVerbose
+    }
+
+    public func emitVerbose(
+        source: String,
+        message: String,
+        metadata: [String: JSONValue] = [:]
+    ) async {
+        guard verbose == true else { return }
+        await onVerbose?(VerboseEvent(source: source, message: message, metadata: metadata))
     }
 }

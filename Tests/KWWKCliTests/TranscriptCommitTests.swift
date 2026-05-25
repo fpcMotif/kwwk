@@ -26,6 +26,13 @@ struct TranscriptCommitTests {
         AgentToolResult(content: [.text(TextContent(text: text))])
     }
 
+    private func toolDisplay(_ text: String) -> AgentToolResult {
+        AgentToolResult(
+            content: [.text(TextContent(text: text))],
+            uiDisplay: [text]
+        )
+    }
+
     @MainActor
     @Test("user message commits immediately with leading blank + prompt marker")
     func userCommitsImmediately() {
@@ -102,6 +109,75 @@ struct TranscriptCommitTests {
     }
 
     @MainActor
+    @Test("verbose events queue while assistant output is streaming")
+    func verboseQueuesDuringStreaming() {
+        let r = TranscriptRenderer()
+        r.apply(.messageStart(message: .assistant(stubAssistant(""))))
+        r.apply(.verbose(VerboseEvent(
+            source: "openai.responses.websocket",
+            message: "connected",
+            metadata: ["input_count": .int(1)]
+        )))
+
+        #expect(r.drainCommits().isEmpty)
+        #expect(!r.liveLines.contains(where: { $0.contains("connected") }))
+
+        r.apply(.messageEnd(message: .assistant(stubAssistant("hello"))))
+        let commits = r.drainCommits()
+        let assistantIdx = commits.firstIndex(where: { $0.contains("hello") })
+        let verboseIdx = commits.firstIndex(where: { $0.contains("verbose [openai.responses.websocket]: connected") })
+
+        #expect(assistantIdx != nil)
+        #expect(verboseIdx != nil)
+        if let assistantIdx, let verboseIdx {
+            #expect(assistantIdx < verboseIdx)
+        }
+        #expect(commits.contains(where: { $0.contains("input_count=1") }))
+    }
+
+    @MainActor
+    @Test("streamRewind drops verbose events queued for the failed attempt")
+    func streamRewindDropsQueuedVerbose() {
+        let r = TranscriptRenderer()
+        r.apply(.messageStart(message: .assistant(stubAssistant(""))))
+        r.apply(.verbose(VerboseEvent(
+            source: "openai.responses.websocket",
+            message: "failed attempt log",
+            metadata: [:]
+        )))
+
+        r.apply(.streamRewind)
+        r.apply(.messageStart(message: .assistant(stubAssistant(""))))
+        r.apply(.verbose(VerboseEvent(
+            source: "openai.responses.websocket",
+            message: "retry attempt log",
+            metadata: [:]
+        )))
+        r.apply(.messageEnd(message: .assistant(stubAssistant("hello"))))
+
+        let commits = r.drainCommits()
+        #expect(!commits.contains(where: { $0.contains("failed attempt log") }))
+        #expect(commits.contains(where: { $0.contains("retry attempt log") }))
+    }
+
+    @MainActor
+    @Test("agentEnd flushes queued verbose even if streaming did not close cleanly")
+    func agentEndFlushesQueuedVerboseWhileStreaming() {
+        let r = TranscriptRenderer()
+        r.apply(.messageStart(message: .assistant(stubAssistant(""))))
+        r.apply(.verbose(VerboseEvent(
+            source: "openai.responses.websocket",
+            message: "stream teardown log",
+            metadata: [:]
+        )))
+
+        r.apply(.agentEnd(messages: [], summary: AgentRunSummary()))
+
+        let commits = r.drainCommits()
+        #expect(commits.contains(where: { $0.contains("stream teardown log") }))
+    }
+
+    @MainActor
     @Test("tool execution commits on end with header + result preview")
     func toolCommitsOnEnd() {
         let r = TranscriptRenderer()
@@ -129,6 +205,33 @@ struct TranscriptCommitTests {
         #expect(commits.contains(where: { $0.contains("file1") }))
         #expect(commits.last != "")
         #expect(r.liveLines.isEmpty)
+    }
+
+    @MainActor
+    @Test("tool execution updates render partial ui display while running")
+    func toolExecutionUpdateRendersPartialDisplay() {
+        let r = TranscriptRenderer()
+        r.apply(.toolExecutionStart(toolCallId: "1", toolName: "agent", args: .object([:])))
+        r.apply(.toolExecutionUpdate(
+            toolCallId: "1",
+            toolName: "agent",
+            args: .object([:]),
+            partialResult: toolDisplay("agent explore running · 128 tokens")
+        ))
+
+        #expect(r.drainCommits().isEmpty)
+        #expect(r.liveLines.contains(where: { $0.contains("128 tokens") }))
+        #expect(!r.liveLines.contains(where: { $0.contains("running…") }))
+
+        r.apply(.toolExecutionEnd(
+            toolCallId: "1",
+            toolName: "agent",
+            result: toolDisplay("agent explore completed · 256 tokens"),
+            isError: false
+        ))
+        let commits = r.drainCommits()
+        #expect(commits.contains(where: { $0.contains("256 tokens") }))
+        #expect(!commits.contains(where: { $0.contains("128 tokens") }))
     }
 
     @MainActor

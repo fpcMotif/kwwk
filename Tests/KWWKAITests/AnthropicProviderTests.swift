@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import Testing
 @testable import KWWKAI
 
@@ -195,6 +198,31 @@ struct AnthropicProviderTests {
         #expect(req?.headers["x-api-key"] == "override-key")
         #expect(req?.headers["anthropic-version"] == "2023-06-01")
         #expect(req?.headers["accept"] == "text/event-stream")
+    }
+
+    @Test("resolved auth can select bearer scheme and merge custom headers")
+    func resolvedAuthBearerHeaders() async throws {
+        let client = StubSSEClient(body: Self.textSSE)
+        let provider = AnthropicProvider(client: client, defaultAPIKey: "default-key")
+        _ = provider.stream(
+            model: Self.sampleModel,
+            context: Context(messages: [.user(UserMessage(text: "hi"))]),
+            options: StreamOptions(
+                apiKey: "ignored-key",
+                headers: ["x-extra": "override"],
+                resolvedAuth: ResolvedProviderAuth(
+                    token: "oauth-token",
+                    scheme: .bearer,
+                    headers: ["anthropic-beta": "oauth-2025-04-20", "x-extra": "auth"]
+                )
+            )
+        )
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        let headers = client.lastRequest?.headers ?? [:]
+        #expect(headers["Authorization"] == "Bearer oauth-token")
+        #expect(headers["x-api-key"] == nil)
+        #expect(headers["anthropic-beta"] == "oauth-2025-04-20")
+        #expect(headers["x-extra"] == "override")
     }
 
     @Test("encodes user text and tool blocks in Anthropic body shape")

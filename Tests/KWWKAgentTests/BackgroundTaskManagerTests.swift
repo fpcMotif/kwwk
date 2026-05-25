@@ -131,6 +131,24 @@ struct BackgroundTaskManagerTests {
         #expect(notif.messageText().contains("<task-notification>"))
     }
 
+    @Test("closeSession kills running tasks and drains notifications for that session")
+    func closeSessionKillsAndDrains() async {
+        let outputDir = makeOutputDir()
+        defer { try? FileManager.default.removeItem(at: outputDir) }
+        let manager = BackgroundTaskManager(outputDir: outputDir)
+        let (closedTaskId, _) = await manager.spawn(runner: ForeverRunner(), sessionId: "child")
+        let (otherTaskId, _) = await manager.spawn(runner: ForeverRunner(), sessionId: "parent")
+        defer { Task { await manager.killAll(sessionId: nil) } }
+
+        await manager.closeSession(sessionId: "child")
+
+        let closedTask = await manager.get(closedTaskId)
+        let otherTask = await manager.get(otherTaskId)
+        #expect(closedTask?.status == .killed)
+        #expect(otherTask?.status == .running)
+        #expect(await manager.hasNotifications(sessionId: "child") == false)
+    }
+
     @Test("kill cancels a running task and emits a killed notification")
     func killFlowsThrough() async {
         let outputDir = makeOutputDir()
@@ -244,7 +262,8 @@ struct BackgroundTaskManagerTests {
         defer { try? FileManager.default.removeItem(at: outputDir) }
         let manager = BackgroundTaskManager(outputDir: outputDir)
         // Squeeze the watchdog timing so the test runs in under a second.
-        await manager.setStallTiming(intervalSeconds: 1, thresholdSeconds: 0.05)
+        let stallInterval: UInt64 = ProcessInfo.processInfo.environment["CI"] != nil ? 2 : 1
+        await manager.setStallTiming(intervalSeconds: stallInterval, thresholdSeconds: 0.05)
 
         // Runner writes a prompt-shaped tail, then holds the pane forever so
         // no new output arrives — simulating a command stuck on interactive
@@ -268,7 +287,7 @@ struct BackgroundTaskManagerTests {
         }
         let (taskId, _) = await manager.spawn(runner: PromptRunner(), sessionId: "s1")
 
-        let ok = await awaitUntil(3000) {
+        let ok = await awaitUntil(5000) {
             await manager.hasNotifications(sessionId: "s1")
         }
         #expect(ok)

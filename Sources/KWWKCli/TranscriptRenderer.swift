@@ -51,6 +51,11 @@ final class TranscriptRenderer {
     /// the live zone). Reset to 0 on every `messageStart(.assistant)`.
     private var streamingCommittedPrefix: Int = 0
 
+    /// Verbose diagnostics that arrived while the assistant body was live.
+    /// They are committed after `messageEnd` so provider logs don't interleave
+    /// with token streaming in the live zone.
+    private var queuedVerboseLines: [String] = []
+
     /// In-flight tool calls, kept in **start order** so we can drain the
     /// front-of-queue when settlements land (out-of-order completions
     /// wait for preceding ones). Each slot carries either a `.running`
@@ -61,6 +66,7 @@ final class TranscriptRenderer {
         let id: String
         let name: String
         let args: JSONValue
+        var partial: AgentToolResult?
         var resolution: [String]?   // nil = running
     }
 
@@ -135,6 +141,8 @@ final class TranscriptRenderer {
             n += 1  // header
             if let resolved = slot.resolution {
                 n += max(0, resolved.count - 2)  // body (skip leading blank + header)
+            } else if let partial = slot.partial {
+                n += formatToolResult(partial, isError: false).count
             } else {
                 n += 1  // "running…"
             }
@@ -218,12 +226,18 @@ final class TranscriptRenderer {
                 streamingBody = []
                 streamingCommittedPrefix = 0
                 recomputeLive()
+                flushQueuedVerbose()
             case .toolResult, .user:
                 break
             }
 
         case .toolExecutionStart(let id, let name, let args):
-            toolSlots.append(ToolSlot(id: id, name: name, args: args, resolution: nil))
+            toolSlots.append(ToolSlot(id: id, name: name, args: args, partial: nil, resolution: nil))
+            recomputeLive()
+
+        case .toolExecutionUpdate(let id, _, _, let partialResult):
+            guard let idx = toolSlots.firstIndex(where: { $0.id == id }) else { break }
+            toolSlots[idx].partial = partialResult
             recomputeLive()
 
         case .toolExecutionEnd(let id, _, let result, let isError):
@@ -239,7 +253,7 @@ final class TranscriptRenderer {
             recomputeLive()
 
         case .agentEnd:
-            break
+            flushQueuedVerbose()
 
         case .streamRetry(_, let delayMs, _):
             let delayLabel = delayMs >= 1000
@@ -264,7 +278,16 @@ final class TranscriptRenderer {
             }
             streamingBody = []
             streamingCommittedPrefix = 0
+            queuedVerboseLines.removeAll()
             recomputeLive()
+
+        case .verbose(let event):
+            let lines = renderVerbose(event)
+            if streaming {
+                queuedVerboseLines.append(contentsOf: lines)
+            } else {
+                commit(lines)
+            }
 
         default: break
         }
@@ -288,6 +311,12 @@ final class TranscriptRenderer {
             commit(resolved)
             toolSlots.removeFirst()
         }
+    }
+
+    private func flushQueuedVerbose() {
+        guard !queuedVerboseLines.isEmpty else { return }
+        commit(queuedVerboseLines)
+        queuedVerboseLines.removeAll()
     }
 
     /// Rebuild `liveLines` from the current streaming body + any
@@ -319,6 +348,8 @@ final class TranscriptRenderer {
                 // two from the resolved payload and keep only the body.
                 let body = resolved.dropFirst(2)
                 out.append(contentsOf: body)
+            } else if let partial = slot.partial {
+                out.append(contentsOf: formatToolResult(partial, isError: false))
             } else {
                 out.append(Style.dimmed("  ⎿  running…"))
             }
@@ -483,6 +514,26 @@ final class TranscriptRenderer {
             out.append(styler("  ⎿ … \(hidden) more lines"))
         }
         return out
+    }
+
+    private func renderVerbose(_ event: VerboseEvent) -> [String] {
+        var line = "  verbose"
+        if !event.source.isEmpty {
+            line += " [\(event.source)]"
+        }
+        line += ": \(event.message)"
+        let metadata = formatVerboseMetadata(event.metadata)
+        if !metadata.isEmpty {
+            line += " · \(metadata)"
+        }
+        return ["", Style.dimmed(line)]
+    }
+
+    private func formatVerboseMetadata(_ metadata: [String: JSONValue]) -> String {
+        metadata.keys.sorted().compactMap { key in
+            guard let value = metadata[key] else { return nil }
+            return "\(key)=\(formatValue(value))"
+        }.joined(separator: " ")
     }
 
     private func truncate(_ s: String, to max: Int) -> String {
