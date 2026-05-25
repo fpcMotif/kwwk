@@ -30,7 +30,9 @@ func runHeadlessInternal(
     thinkingLevel: ThinkingLevel = .medium,
     autoCompactThreshold: Double? = 0.75,
     modelOverride: String? = nil,
-    context1m: Bool = false
+    context1m: Bool = false,
+    onStdout: (@Sendable (String) -> Void)? = nil,
+    onStderr: (@Sendable (String) -> Void)? = nil
 ) async throws -> Int32 {
     let resolved = try await resolveAgentAuth(modelOverride: modelOverride, context1m: context1m)
 
@@ -83,6 +85,7 @@ func runHeadlessInternal(
         case .messageUpdate(_, let inner):
             if case .textDelta(_, let delta, _) = inner {
                 writeStdout(delta)
+                onStdout?(delta)
                 box.lock.withLock {
                     box.needsTrailingNewline = !delta.hasSuffix("\n")
                 }
@@ -97,13 +100,18 @@ func runHeadlessInternal(
                 box.needsTrailingNewline = false
                 return v
             }
-            if needs { writeStdout("\n") }
+            if needs {
+                writeStdout("\n")
+                onStdout?("\n")
+            }
 
         case .agentEnd(_, let summary):
             box.lock.withLock { box.finalStopReason = summary.finalStopReason }
             if summary.finalStopReason != .stop,
                let err = agent.state.errorMessage {
-                writeStderr("kwwk: \(err)\n")
+                let message = "kwwk: \(err)\n"
+                writeStderr(message)
+                onStderr?(message)
             }
 
         default:
@@ -121,7 +129,9 @@ func runHeadlessInternal(
         try await agent.prompt(text)
     } catch {
         let msg = (error as? LocalizedError)?.errorDescription ?? "\(error)"
-        writeStderr("kwwk: \(msg)\n")
+        let message = "kwwk: \(msg)\n"
+        writeStderr(message)
+        onStderr?(message)
         return 1
     }
 

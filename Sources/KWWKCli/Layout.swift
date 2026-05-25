@@ -29,12 +29,12 @@ final class CodingLayout: @unchecked Sendable {
     /// live-tail clip budget leaves room for both.
     let statusRows: Int
 
-    init(statusRows: Int = 1) {
+    init(statusRows: Int = 1, initialInput: String = "") {
         self.liveTail = TextComponent([])
         self.divider = HorizontalRule("─")
         self.status = TextComponent([])
         self.queue = TextComponent([])
-        self.input = InputComponent()
+        self.input = InputComponent(initial: initialInput)
         self.promptRow = PromptRow(prompt: Style.prompt("❯ "), input: input)
 
         self.statusRows = statusRows

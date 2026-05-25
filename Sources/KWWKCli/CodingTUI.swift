@@ -14,7 +14,8 @@ func runCodingTUIInternal(
     tools: CodingTools,
     apiKeyResolver: (@Sendable (String) async -> String?)? = nil,
     autoCompactThreshold: Double? = 0.75,
-    thinkingLevel: ThinkingLevel = .medium
+    thinkingLevel: ThinkingLevel = .medium,
+    initialPrompt: String = ""
 ) async throws {
     // --- agent + background manager -------------------------------------
     let bgManager = BackgroundTaskManager()
@@ -45,7 +46,7 @@ func runCodingTUIInternal(
     // behavior). Pass `useAlternateScreen: true` if you want a blank
     // fullscreen buffer instead.
     let runner = TUIRunner(useAlternateScreen: false, hideCursor: false)
-    let layout = CodingLayout(statusRows: 1)
+    let layout = CodingLayout(statusRows: 1, initialInput: initialPrompt)
     let renderer = TranscriptRenderer()
 
     // Print the header banner once, as ordinary terminal output. It

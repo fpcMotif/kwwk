@@ -13,6 +13,7 @@ let package = Package(
         .library(name: "KWWKAgent", targets: ["KWWKAgent"]),
         .library(name: "KWWKCli", targets: ["KWWKCli"]),
         .executable(name: "kwwk", targets: ["kwwk"]),
+        .executable(name: "KWWKLauncher", targets: ["KWWKLauncher"]),
     ],
     dependencies: [
         // swift-crypto's `Crypto` module is source-compatible with Apple's
@@ -45,10 +46,20 @@ let package = Package(
             dependencies: ["KWWKAI", "KWWKAgent"],
             path: "Sources/KWWKCli"
         ),
+        .target(
+            name: "KWWKLauncherCore",
+            dependencies: [],
+            path: "Sources/KWWKLauncherCore"
+        ),
         .executableTarget(
             name: "kwwk",
-            dependencies: ["KWWKCli"],
+            dependencies: ["KWWKCli", "KWWKLauncherCore"],
             path: "Sources/kwwk"
+        ),
+        .executableTarget(
+            name: "KWWKLauncher",
+            dependencies: ["KWWKLauncherCore"],
+            path: "Sources/KWWKLauncher"
         ),
         .testTarget(
             name: "KWWKAITests",
@@ -64,6 +75,11 @@ let package = Package(
             name: "KWWKCliTests",
             dependencies: ["KWWKCli", "KWWKAgent", "KWWKAI"],
             path: "Tests/KWWKCliTests"
+        ),
+        .testTarget(
+            name: "KWWKLauncherCoreTests",
+            dependencies: ["KWWKLauncherCore"],
+            path: "Tests/KWWKLauncherCoreTests"
         ),
     ],
     swiftLanguageModes: [.v6]
