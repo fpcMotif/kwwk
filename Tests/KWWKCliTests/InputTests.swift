@@ -99,6 +99,13 @@ struct InputComponentTests {
         #expect(!rows[0].contains(CURSOR_MARKER), "cursor should be on row 1 (the 'x' row), not row 0")
         #expect(rows[1].contains(CURSOR_MARKER))
     }
+
+    @Test("coding layout can start with a launcher draft prompt") func layoutInitialInput() {
+        let layout = CodingLayout(statusRows: 1, initialInput: "review this diff")
+
+        #expect(layout.input.value == "review this diff")
+        #expect(layout.input.cursor == "review this diff".count)
+    }
 }
 
 @Suite("Keybinding matching")

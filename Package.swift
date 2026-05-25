@@ -13,6 +13,7 @@ let package = Package(
         .library(name: "KWWKAgent", targets: ["KWWKAgent"]),
         .library(name: "KWWKCli", targets: ["KWWKCli"]),
         .executable(name: "kwwk", targets: ["kwwk"]),
+        .executable(name: "KWWKLauncher", targets: ["KWWKLauncher"]),
         .executable(name: "kwwk-generate-models", targets: ["kwwk-generate-models"]),
     ],
     dependencies: [
@@ -47,13 +48,23 @@ let package = Package(
             path: "Sources/KWWKCli"
         ),
         .target(
+            name: "KWWKLauncherCore",
+            dependencies: [],
+            path: "Sources/KWWKLauncherCore"
+        ),
+        .target(
             name: "KWWKGenerateModelsCore",
             path: "Scripts/GenerateModelsCore"
         ),
         .executableTarget(
             name: "kwwk",
-            dependencies: ["KWWKCli"],
+            dependencies: ["KWWKCli", "KWWKLauncherCore"],
             path: "Sources/kwwk"
+        ),
+        .executableTarget(
+            name: "KWWKLauncher",
+            dependencies: ["KWWKLauncherCore"],
+            path: "Sources/KWWKLauncher"
         ),
         .executableTarget(
             name: "kwwk-generate-models",
@@ -74,6 +85,11 @@ let package = Package(
             name: "KWWKCliTests",
             dependencies: ["KWWKCli", "KWWKAgent", "KWWKAI"],
             path: "Tests/KWWKCliTests"
+        ),
+        .testTarget(
+            name: "KWWKLauncherCoreTests",
+            dependencies: ["KWWKLauncherCore"],
+            path: "Tests/KWWKLauncherCoreTests"
         ),
     ],
     swiftLanguageModes: [.v6]

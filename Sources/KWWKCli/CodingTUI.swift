@@ -2,6 +2,14 @@ import Foundation
 import KWWKAI
 import KWWKAgent
 
+/// Main-actor box for the auto-compacting flag so the `@Sendable` agent-event
+/// and keybinding closures can share it without tripping Swift 6 sendability
+/// checks. Both closures touch it only after hopping to the main actor.
+@MainActor
+private final class AutoCompactingFlag {
+    var value = false
+}
+
 /// Internal implementation of the coding-agent TUI. Public entry points
 /// live on `KWWK` (see KWWK.swift) and resolve credentials before calling
 /// in here. `@MainActor` because `TranscriptRenderer`, `CodingStatusBar`,
@@ -15,7 +23,8 @@ func runCodingTUIInternal(
     builtinSubagents: BuiltinSubagentSelection = .all,
     authResolver: (@Sendable (Model, String?) async -> ResolvedProviderAuth?)? = nil,
     autoCompactThreshold: Double? = 0.75,
-    thinkingLevel: ThinkingLevel = .medium
+    thinkingLevel: ThinkingLevel = .medium,
+    initialPrompt: String = ""
 ) async throws {
     // --- agent + background manager -------------------------------------
     let bgManager = BackgroundTaskManager()
@@ -44,7 +53,7 @@ func runCodingTUIInternal(
     // behavior). Pass `useAlternateScreen: true` if you want a blank
     // fullscreen buffer instead.
     let runner = TUIRunner(useAlternateScreen: false, hideCursor: false)
-    let layout = CodingLayout(statusRows: 1)
+    let layout = CodingLayout(statusRows: 1, initialInput: initialPrompt)
     let renderer = TranscriptRenderer()
 
     // Print the header banner once, as ordinary terminal output. It
@@ -175,7 +184,7 @@ func runCodingTUIInternal(
     )
     await statusBar.render()
 
-    var isAutoCompacting = false
+    let autoCompacting = AutoCompactingFlag()
 
     // Keep the renderer's display mode in sync with the agent's state on
     // every event, so `/thinking show|hide` (which only mutates agent
@@ -205,18 +214,18 @@ func runCodingTUIInternal(
             case .agentStart:
                 statusBar.setMode(.streaming)
             case .agentEnd:
-                if !isAutoCompacting {
+                if !autoCompacting.value {
                     statusBar.setMode(.idle)
                 }
             case .compactStart(let count, _):
-                isAutoCompacting = true
+                autoCompacting.value = true
                 statusBar.setCompacting(messageCount: count)
                 runner.tui.commit([
                     "",
                     Style.dimmed("  ◐ auto-compacting…"),
                 ])
             case .compactEnd(let outcome):
-                isAutoCompacting = false
+                autoCompacting.value = false
                 statusBar.setMode(.idle)
                 switch outcome {
                 case .compacted(let n, let hasLedger):
@@ -326,7 +335,7 @@ func runCodingTUIInternal(
             guard !text.isEmpty else { return }
 
             let parsed = SlashInput.parse(text)
-            let busy = agent.state.isStreaming || isAutoCompacting
+            let busy = agent.state.isStreaming || autoCompacting.value
 
             // Slash commands are idle-only. If the agent is mid-turn
             // we can't reliably run them (some mutate agent state, all
