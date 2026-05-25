@@ -30,6 +30,23 @@ workflow, or reveal a local artifact.
 Avoid: "action" for this concept. Actions are the secondary operations attached
 to a command.
 
+## Trigger
+
+A command's title or keyword that, when it prefixes the search query, is
+stripped so the remainder becomes the argument. Triggers are matched
+case-insensitively, longest first.
+
+Avoid: "prefix" or "keyword" alone when the meaning is the strippable phrase
+that precedes a command's argument.
+
+## Argument
+
+The portion of the search query that remains after a command's trigger is
+removed — the user's real input to a prompt, quicklink, snippet, or workflow.
+
+Avoid: "query" when the meaning is the post-trigger remainder rather than the
+full search text.
+
 ## Action
 
 A secondary operation available for a selected command, such as copy, reveal,
